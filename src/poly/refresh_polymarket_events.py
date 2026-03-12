@@ -1,4 +1,6 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 import sys
 from typing import Any, Dict, List
 
@@ -26,10 +28,53 @@ def build_category_from_existing_row(existing_row: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def rows_differ(existing_row: Dict[str, Any], candidate_row: Dict[str, Any]) -> bool:
+    for key, value in candidate_row.items():
+        if existing_row.get(key) != value:
+            return True
+    return False
+
+
+def fetch_updates_for_tag_slug(
+    polymarket_events_url: str,
+    events_page_size: int,
+    tag_slug: str,
+    existing_events_by_id: Dict[int, Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    selected_events_by_id: Dict[int, Dict[str, Any]] = {}
+    category_events = fetch_polymarket_events_by_tag_slug(
+        polymarket_events_url,
+        events_page_size,
+        tag_slug,
+    )
+    for event in category_events:
+        event_id = as_int(event.get("id"))
+        if event_id is None:
+            continue
+        existing_row = existing_events_by_id.get(event_id)
+        if existing_row is None:
+            continue
+
+        row = build_event_row(
+            event,
+            build_category_from_existing_row(existing_row),
+            existing_row=existing_row,
+        )
+        if row is None:
+            continue
+
+        existing = selected_events_by_id.get(row["id"])
+        if existing is None or row["volume"] > existing["volume"]:
+            selected_events_by_id[row["id"]] = row
+    return selected_events_by_id
+
+
 def collect_existing_event_updates(
     polymarket_events_url: str,
     events_page_size: int,
     existing_events_by_id: Dict[int, Dict[str, Any]],
+    *,
+    max_workers: int,
 ) -> List[Dict[str, Any]]:
     selected_events_by_id: Dict[int, Dict[str, Any]] = {}
     tracked_slugs = sorted(
@@ -40,31 +85,25 @@ def collect_existing_event_updates(
         }
     )
 
-    for tag_slug in tracked_slugs:
-        category_events = fetch_polymarket_events_by_tag_slug(
-            polymarket_events_url,
-            events_page_size,
-            tag_slug,
-        )
-        for event in category_events:
-            event_id = as_int(event.get("id"))
-            if event_id is None:
-                continue
-            existing_row = existing_events_by_id.get(event_id)
-            if existing_row is None:
-                continue
+    if not tracked_slugs:
+        return []
 
-            row = build_event_row(
-                event,
-                build_category_from_existing_row(existing_row),
-                existing_row=existing_row,
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                fetch_updates_for_tag_slug,
+                polymarket_events_url,
+                events_page_size,
+                tag_slug,
+                existing_events_by_id,
             )
-            if row is None:
-                continue
-
-            existing = selected_events_by_id.get(row["id"])
-            if existing is None or row["volume"] > existing["volume"]:
-                selected_events_by_id[row["id"]] = row
+            for tag_slug in tracked_slugs
+        ]
+        for future in as_completed(futures):
+            for row in future.result().values():
+                existing = selected_events_by_id.get(row["id"])
+                if existing is None or row["volume"] > existing["volume"]:
+                    selected_events_by_id[row["id"]] = row
 
     updated_events = list(selected_events_by_id.values())
     updated_events.sort(key=lambda row: row["volume"], reverse=True)
@@ -85,6 +124,42 @@ def count_invalidated_events(
     return total
 
 
+def filter_changed_rows(
+    updated_rows: List[Dict[str, Any]],
+    existing_events_by_id: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    changed_rows: List[Dict[str, Any]] = []
+    for row in updated_rows:
+        existing_row = existing_events_by_id.get(int(row["id"]))
+        if existing_row is None:
+            continue
+        if rows_differ(existing_row, row):
+            changed_rows.append(row)
+    return changed_rows
+
+
+def require_env_int_any_or_default(
+    names: List[str],
+    *,
+    default: int,
+    min_value: int = 1,
+) -> int:
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            joined = ", ".join(names)
+            raise ValueError(f"Valor entero invalido para {joined}: {raw!r}") from exc
+        if value < min_value:
+            joined = ", ".join(names)
+            raise ValueError(f"El valor de {joined} debe ser >= {min_value}.")
+        return value
+    return default
+
+
 def main() -> None:
     load_dotenv()
 
@@ -97,24 +172,32 @@ def main() -> None:
         ["POLY_SUPABASE_EVENTS_TABLE", "SUPABASE_POLY_EVENTS_TABLE", "POLY_EVENTS_TABLE"]
     )
     events_page_size = require_env_int_any(["POLY_EVENTS_PAGE_SIZE"], min_value=1)
+    refresh_max_workers = require_env_int_any_or_default(
+        ["POLY_REFRESH_MAX_WORKERS"],
+        default=8,
+        min_value=1,
+    )
 
     existing_events_by_id = fetch_existing_event_state(
         supabase_url,
         supabase_key,
         supabase_events_table,
+        filters=["closed=eq.false"],
     )
     updated_rows = collect_existing_event_updates(
         polymarket_events_url,
         events_page_size,
         existing_events_by_id,
+        max_workers=refresh_max_workers,
     )
-    invalidated_events = count_invalidated_events(updated_rows, existing_events_by_id)
+    changed_rows = filter_changed_rows(updated_rows, existing_events_by_id)
+    invalidated_events = count_invalidated_events(changed_rows, existing_events_by_id)
 
     upsert_rows(
         supabase_url,
         supabase_key,
         supabase_events_table,
-        updated_rows,
+        changed_rows,
         on_conflict="id",
         batch_size=50,
         timeout=90,
@@ -122,7 +205,8 @@ def main() -> None:
     )
 
     print(f"Eventos existentes revisados: {len(existing_events_by_id)}")
-    print(f"Eventos actualizados desde Polymarket: {len(updated_rows)}")
+    print(f"Eventos recibidos desde Polymarket: {len(updated_rows)}")
+    print(f"Eventos con cambios guardados en Supabase: {len(changed_rows)}")
     print(f"Eventos marcados de nuevo para enrichment: {invalidated_events}")
 
 

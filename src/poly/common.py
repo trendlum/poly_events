@@ -368,16 +368,19 @@ def fetch_existing_event_state(
     supabase_url: str,
     supabase_key: str,
     supabase_events_table: str,
+    *,
+    filters: Optional[List[str]] = None,
 ) -> Dict[int, Dict[str, Any]]:
     rows = fetch_paginated_rows(
         supabase_url,
         supabase_key,
         supabase_events_table,
         (
-            "id,category_id,category_label,tag_slug,is_enriched,title,slug,ticker,"
+            "id,category_id,category_label,tag_slug,closed,is_enriched,title,slug,ticker,"
             "description,resolution_source,polymarket_category,market_questions,"
             "market_descriptions,tags,tag_slugs,search_text"
         ),
+        filters=filters,
     )
 
     existing_by_id: Dict[int, Dict[str, Any]] = {}
