@@ -1,0 +1,111 @@
+name: Data sync
+
+on:
+  repository_dispatch:
+    types: [sync_poly_events]
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Trigger source"
+        required: false
+        default: "manual"
+      ts:
+        description: "ISO timestamp"
+        required: false
+        default: ""
+
+concurrency:
+  group: data-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Prepare env
+        env:
+          POLY_DOTENV: ${{ secrets.POLY_DOTENV }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          if [ -z "${POLY_DOTENV}" ]; then
+            echo "ERROR: Missing required secret."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_URL}" ]; then
+            echo "ERROR: Missing required secret."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_KEY}" ]; then
+            echo "ERROR: Missing required secret."
+            exit 1
+          fi
+          printf '%s\n' "${POLY_DOTENV}" > .env
+          printf 'SUPABASE_URL=%s\n' "${SUPABASE_URL}" >> .env
+          printf 'SUPABASE_KEY=%s\n' "${SUPABASE_KEY}" >> .env
+
+      - name: Validate env
+        run: |
+          required_poly_vars=(
+            "POLY_SUPABASE_CATEGORIES_TABLE="
+            "POLY_SUPABASE_EVENTS_TABLE="
+            "POLY_SUPABASE_EVENTS_ENRICHED_TABLE="
+            "POLY_GAMMA_CATEGORIES_URL="
+            "POLY_GAMMA_EVENTS_URL="
+            "POLY_EVENT_TAXONOMY_KEYWORDS_TABLE="
+            "POLY_EVENT_ENTITY_KEYWORDS_TABLE="
+            "POLY_EVENTS_PAGE_SIZE="
+            "POLY_EVENTS_ENRICH_BATCH_SIZE="
+          )
+          for key in "${required_poly_vars[@]}"; do
+            if ! grep -q "^${key}" .env; then
+              echo "ERROR: Missing required configuration."
+              exit 1
+            fi
+          done
+
+          required_vars=(
+            "SUPABASE_URL="
+            "SUPABASE_KEY="
+          )
+          for key in "${required_vars[@]}"; do
+            if ! grep -q "^${key}" .env; then
+              echo "ERROR: Missing required configuration."
+              exit 1
+            fi
+          done
+
+      - name: Step 1
+        run: python src/poly/list_polymarket_categories.py
+
+      - name: Step 2
+        run: python src/poly/sync_polymarket_events.py
+
+      - name: Step 3
+        run: python src/poly/enrich_polymarket_events.py
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f .env
+          if [ -f ".env" ]; then
+            echo "ERROR: Cleanup failed."
+            exit 1
+          fi
