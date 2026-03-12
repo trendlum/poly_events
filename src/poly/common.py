@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 from requests.exceptions import HTTPError, RequestException
@@ -390,6 +390,30 @@ def fetch_existing_event_state(
             continue
         existing_by_id[row_id] = row
     return existing_by_id
+
+
+def fetch_existing_event_ids(
+    supabase_url: str,
+    supabase_key: str,
+    supabase_events_table: str,
+    *,
+    filters: Optional[List[str]] = None,
+) -> Set[int]:
+    rows = fetch_paginated_rows(
+        supabase_url,
+        supabase_key,
+        supabase_events_table,
+        "id",
+        filters=filters,
+    )
+
+    existing_ids: Set[int] = set()
+    for row in rows:
+        row_id = as_int(row.get("id"))
+        if row_id is None:
+            continue
+        existing_ids.add(row_id)
+    return existing_ids
 
 
 def upsert_rows(
