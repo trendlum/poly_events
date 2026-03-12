@@ -1,8 +1,8 @@
-name: Data sync
+name: Sync new poly events
 
 on:
   repository_dispatch:
-    types: [sync_poly_events]
+    types: [sync_poly_new_events]
   workflow_dispatch:
     inputs:
       source:
@@ -15,7 +15,7 @@ on:
         default: ""
 
 concurrency:
-  group: data-sync
+  group: sync-poly-new-events
   cancel-in-progress: false
 
 permissions:
@@ -92,13 +92,13 @@ jobs:
             fi
           done
 
-      - name: Step 1
+      - name: Sync categories
         run: python src/poly/list_polymarket_categories.py
 
-      - name: Step 2
+      - name: Insert new events
         run: python src/poly/sync_polymarket_events.py
 
-      - name: Step 3
+      - name: Enrich pending events
         run: python src/poly/enrich_polymarket_events.py
 
       - name: Cleanup

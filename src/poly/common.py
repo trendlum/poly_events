@@ -195,6 +195,25 @@ def build_existing_enrichment_basis_text(
     )
 
 
+def should_reset_enrichment(
+    existing_row: Optional[Dict[str, Any]],
+    candidate_row: Dict[str, Any],
+) -> bool:
+    if not existing_row or not bool(existing_row.get("is_enriched")):
+        return False
+
+    tracked_fields = [
+        "title",
+        "description",
+        "market_descriptions",
+        "search_text",
+    ]
+    for field in tracked_fields:
+        if existing_row.get(field) != candidate_row.get(field):
+            return True
+    return False
+
+
 def build_event_row(
     event: Dict[str, Any],
     category: Dict[str, Any],
@@ -264,9 +283,7 @@ def build_event_row(
     previous_enrichment_basis = (
         build_existing_enrichment_basis_text(existing_row) if existing_row else ""
     )
-    is_enriched = previous_is_enriched and previous_enrichment_basis == current_enrichment_basis
-
-    return {
+    row = {
         "id": event_id,
         "title": _clean_text(event.get("title")),
         "slug": _clean_text(event.get("slug")),
@@ -302,8 +319,49 @@ def build_event_row(
         "tags": tag_labels,
         "tag_slugs": tag_slugs,
         "search_text": search_text,
-        "is_enriched": is_enriched,
+        "is_enriched": previous_is_enriched and previous_enrichment_basis == current_enrichment_basis,
     }
+    if should_reset_enrichment(existing_row, row):
+        row["is_enriched"] = False
+    return row
+
+
+def fetch_paginated_rows(
+    supabase_url: str,
+    supabase_key: str,
+    table: str,
+    select: str,
+    *,
+    filters: Optional[List[str]] = None,
+    page_size: int = 1000,
+) -> List[Dict[str, Any]]:
+    all_rows: List[Dict[str, Any]] = []
+    offset = 0
+
+    while True:
+        query_parts = [f"select={select}", f"limit={page_size}", f"offset={offset}"]
+        if filters:
+            query_parts.extend(filters)
+        endpoint = f"{supabase_url}/rest/v1/{table}?{'&'.join(query_parts)}"
+        response = requests.get(endpoint, headers=supabase_headers(supabase_key), timeout=30)
+        try:
+            response.raise_for_status()
+        except HTTPError as exc:
+            if response.status_code == 404:
+                raise ValueError(f"No existe la tabla '{table}' en Supabase.") from exc
+            raise
+
+        page = response.json()
+        if not isinstance(page, list):
+            raise ValueError(f"Respuesta inesperada al leer la tabla '{table}'.")
+
+        rows = [row for row in page if isinstance(row, dict)]
+        all_rows.extend(rows)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return all_rows
 
 
 def fetch_existing_event_state(
@@ -311,27 +369,19 @@ def fetch_existing_event_state(
     supabase_key: str,
     supabase_events_table: str,
 ) -> Dict[int, Dict[str, Any]]:
-    endpoint = (
-        f"{supabase_url}/rest/v1/{supabase_events_table}"
-        "?select=id,is_enriched,title,slug,ticker,description,resolution_source,"
-        "polymarket_category,category_label,tag_slug,market_questions,tags,tag_slugs"
+    rows = fetch_paginated_rows(
+        supabase_url,
+        supabase_key,
+        supabase_events_table,
+        (
+            "id,category_id,category_label,tag_slug,is_enriched,title,slug,ticker,"
+            "description,resolution_source,polymarket_category,market_questions,"
+            "market_descriptions,tags,tag_slugs,search_text"
+        ),
     )
-    response = requests.get(endpoint, headers=supabase_headers(supabase_key), timeout=30)
-    try:
-        response.raise_for_status()
-    except HTTPError as exc:
-        if response.status_code == 404:
-            return {}
-        raise
-
-    rows = response.json()
-    if not isinstance(rows, list):
-        raise ValueError("Respuesta inesperada al leer eventos existentes de Supabase.")
 
     existing_by_id: Dict[int, Dict[str, Any]] = {}
     for row in rows:
-        if not isinstance(row, dict):
-            continue
         row_id = as_int(row.get("id"))
         if row_id is None:
             continue
