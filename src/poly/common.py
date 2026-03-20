@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 from typing import Any, Dict, List, Optional, Set
 
 import requests
@@ -63,6 +64,34 @@ def as_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_buy_yes(markets: List[Dict[str, Any]]) -> Optional[float]:
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        raw_prices = market.get("outcomePrices")
+        prices: List[Any]
+        if isinstance(raw_prices, list):
+            prices = raw_prices
+        elif isinstance(raw_prices, str):
+            try:
+                parsed = json.loads(raw_prices)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, list):
+                continue
+            prices = parsed
+        else:
+            continue
+
+        if not prices:
+            continue
+        try:
+            return float(prices[0])
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def fetch_polymarket_events_by_tag_slug(
@@ -288,6 +317,7 @@ def build_event_row(
         "title": _clean_text(event.get("title")),
         "slug": _clean_text(event.get("slug")),
         "ticker": _clean_text(event.get("ticker")),
+        "icon": _clean_text(event.get("icon")),
         "category_id": category["id"],
         "category_label": _clean_text(category.get("label")),
         "tag_slug": _clean_text(category.get("slug")),
@@ -307,6 +337,7 @@ def build_event_row(
         "liquidity": as_float(event.get("liquidity")),
         "liquidity_amm": as_float(event.get("liquidityAmm")),
         "volume": as_float(event.get("volume")),
+        "buy_yes": _extract_buy_yes(markets),
         "open_interest": as_float(event.get("openInterest")),
         "volume24hr": as_float(event.get("volume24hr")),
         "volume1wk": as_float(event.get("volume1wk")),
@@ -376,9 +407,9 @@ def fetch_existing_event_state(
         supabase_key,
         supabase_events_table,
         (
-            "id,category_id,category_label,tag_slug,closed,is_enriched,title,slug,ticker,"
+            "id,category_id,category_label,tag_slug,closed,is_enriched,title,slug,ticker,icon,"
             "description,resolution_source,polymarket_category,market_questions,"
-            "market_descriptions,tags,tag_slugs,search_text"
+            "market_descriptions,tags,tag_slugs,search_text,buy_yes"
         ),
         filters=filters,
     )
